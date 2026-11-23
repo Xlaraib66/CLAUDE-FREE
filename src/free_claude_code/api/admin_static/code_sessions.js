@@ -38,6 +38,7 @@
   const sends = new Set();
   let api,
     root,
+    sidebar,
     feed,
     epoch,
     connected = false,
@@ -80,6 +81,31 @@
       sessionStorage.setItem(`fcc.code.${id}`, JSON.stringify(value));
     } catch {
       /* This tab still works when browser storage is unavailable. */
+    }
+  }
+  const AUTO_KEY = "fcc.autoModel";
+  const AUTO_LEVELS = [
+    ["easy", "Easy", "Short questions and small edits."],
+    ["medium", "Medium", "Everyday coding tasks."],
+    ["hard", "Hard", "Large, multi-file or debugging work."],
+  ];
+  function autoSettings() {
+    const empty = { enabled: false, tiers: { easy: "", medium: "", hard: "" } };
+    try {
+      const value = JSON.parse(localStorage.getItem(AUTO_KEY)) || {};
+      return {
+        enabled: value.enabled === true,
+        tiers: { ...empty.tiers, ...(value.tiers || {}) },
+      };
+    } catch {
+      return empty;
+    }
+  }
+  function saveAutoSettings(value) {
+    try {
+      localStorage.setItem(AUTO_KEY, JSON.stringify(value));
+    } catch {
+      /* Auto selection stays at its previous value without browser storage. */
     }
   }
   function get(id) {
@@ -234,9 +260,11 @@
         notice = data.message;
     }
     if (
-      !selected &&
-      (type === "session.deleted" ||
-        data.session?.revision !== previousRevision)
+      type === "session.deleted" ||
+      (!selected && data.session?.revision !== previousRevision) ||
+      (data.session &&
+        data.session.revision !== previousRevision &&
+        !visibleIds.includes(data.session_id))
     )
       void refreshLibrary();
     render(outputChanged);
@@ -313,7 +341,7 @@
     listAgain = true;
     if (listFlight) return listFlight;
     listFlight = (async () => {
-      while (listAgain && !selected) {
+      while (listAgain) {
         listAgain = false;
         try {
           await list();
@@ -549,7 +577,10 @@
   function navigate(id) {
     const path = id ? `/admin/code/${id}` : "/admin/code";
     history.pushState({}, "", path);
-    activate(path);
+    window.dispatchEvent(new Event("fcc:close-sidebar"));
+    if (root?.closest(".admin-view")?.hidden)
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    else activate(path);
   }
   function activate(path) {
     viewActive = true;
@@ -572,7 +603,10 @@
       notice = "";
       render();
       if (connected && epoch) {
-        const reading = id ? detail(id) : refreshLibrary();
+        const reading = Promise.all([
+          id ? detail(id) : Promise.resolve(),
+          !id || !visibleIds.length ? refreshLibrary() : Promise.resolve(),
+        ]);
         const token = viewToken;
         void reading.catch((error) => {
           if (token === viewToken) restart(error.message);
@@ -628,30 +662,72 @@
       render();
     }
   }
-  function submit() {
-    const record = records.get(selected);
-    if (
-      !ready(record) ||
-      busy(record) ||
-      pending(record) ||
+  function autoApplies(id, record) {
+    const state = saved(id);
+    return (
+      autoSettings().enabled &&
+      !state.pending &&
+      !state.auto &&
+      !state.manualModel &&
+      record.loaded &&
+      record.runs.size === 0
+    );
+  }
+  // Choose the model once, for the first message of a new session.
+  async function applyAuto(id, record, text) {
+    const result = UI.classifyPrompt(text);
+    const target = catalog.find(
+      (model) => model.id === autoSettings().tiers[result.level],
+    );
+    const before = record.session.model;
+    if (target && target.id !== before) {
+      if (!(await updateSettings({ model: target.id }))) return false;
+    }
+    const used =
+      target ||
+      catalog.find((model) => model.id === records.get(id)?.session?.model);
+    const state = saved(id);
+    state.auto = {
+      level: result.level,
+      reason: result.reasons.slice(0, 2).join(", "),
+      model: used
+        ? `${used.provider_id}/${used.model_name}`
+        : records.get(id)?.session?.model || "",
+      configured: Boolean(target),
+    };
+    save(id, state);
+    renderControls();
+    return true;
+  }
+  async function submit() {
+    const id = selected,
+      record = records.get(id);
+    const blocked = (current) =>
+      !ready(current) ||
+      busy(current) ||
+      pending(current) ||
       !available ||
       settingsPending ||
-      selectionError(record)
-    )
-      return;
-    const state = saved(selected),
-      text = root.querySelector("#codeComposer").value;
-    if (!state.pending && !text.trim()) return;
+      selectionError(current);
+    if (blocked(record)) return;
+    const text = root.querySelector("#codeComposer").value;
+    if (!saved(id).pending && !text.trim()) return;
+    if (text.trim() && autoApplies(id, record)) {
+      if (!(await applyAuto(id, record, text)) || selected !== id) return;
+      if (blocked(records.get(id))) return;
+    }
+    const state = saved(id),
+      current = records.get(id);
     state.draft = text;
     state.pending ||= {
       operation_id: crypto.randomUUID(),
-      expected_revision: record.session.revision,
+      expected_revision: current.session.revision,
       expected_epoch: epoch,
       text,
     };
-    save(selected, state);
+    save(id, state);
     notice = "";
-    void deliver(selected);
+    void deliver(id);
   }
   async function stop() {
     const record = records.get(selected);
@@ -733,6 +809,49 @@
     activeDialog = close;
     root.append(node);
     node.showModal();
+  }
+  function autoSettingsDialog() {
+    dialog(
+      "Automatic model choice",
+      (form) => {
+        const current = autoSettings();
+        const enabled = element("input");
+        enabled.type = "checkbox";
+        enabled.checked = current.enabled;
+        label(
+          form,
+          "Choose the model automatically",
+          enabled,
+          "Applies once, to the first message of a new session. The model never changes during a conversation.",
+        );
+        const selects = {};
+        for (const [key, title, hint] of AUTO_LEVELS) {
+          const select = element("select");
+          select.append(new Option("Keep the session's model", ""));
+          for (const model of catalog)
+            select.append(
+              new Option(`${model.provider_id}/${model.model_name}`, model.id),
+            );
+          const stored = current.tiers[key];
+          if (stored && !catalog.some((model) => model.id === stored))
+            select.append(new Option(`${stored} (unavailable)`, stored));
+          select.value = stored || "";
+          selects[key] = select;
+          label(form, title, select, hint);
+        }
+        return { enabled, selects };
+      },
+      "Save",
+      async ({ enabled, selects }) => {
+        saveAutoSettings({
+          enabled: enabled.checked,
+          tiers: Object.fromEntries(
+            Object.entries(selects).map(([key, select]) => [key, select.value]),
+          ),
+        });
+        renderControls();
+      },
+    );
   }
   function newSession() {
     const id = crypto.randomUUID();
@@ -823,7 +942,7 @@
   async function updateSettings(changes) {
     const id = selected,
       record = records.get(id);
-    if (!ready(record) || settingsPending) return;
+    if (!ready(record) || settingsPending) return false;
     const revision = providerDraft?.revision ?? record.session.revision;
     providerDraft = null;
     settingsPending = true;
@@ -842,6 +961,7 @@
         session.revision > (records.get(id)?.session?.revision || 0)
       )
         get(id).session = session;
+      return true;
     } catch (error) {
       if (selected === id) {
         notice = error.message;
@@ -851,6 +971,7 @@
           restart(failure.message);
         }
       }
+      return false;
     } finally {
       if (selected === id) {
         settingsPending = false;
@@ -917,6 +1038,89 @@
     parent.append(node);
     return node;
   }
+  function buildSidebar() {
+    if (!sidebar || sidebar.dataset.built) return;
+    sidebar.dataset.built = "true";
+    const create = button("+ New", newSession, "primary-button");
+    create.id = "codeNew";
+    create.title = "New code session";
+    const header = element("div", undefined, "session-sidebar-header");
+    header.append(element("h2", "Sessions"), create);
+    const search = UI.search("Search titles and folders", query, (value) => {
+      query = value;
+      visibleIds = [];
+      nextCursor = null;
+      ++libraryToken;
+      render();
+      void refreshLibrary();
+    });
+    const library = element("div", undefined, "session-list");
+    library.id = "codeLibrary";
+    const more = button(
+      "Load more",
+      async () => {
+        libraryLoading = true;
+        render();
+        try {
+          await list(nextCursor);
+        } catch (error) {
+          restart(error.message);
+        }
+        libraryLoading = false;
+        render();
+      },
+      "secondary-button session-load-more",
+    );
+    more.id = "codeMore";
+    sidebar.append(header, search, library, more);
+  }
+  function renderLibrary() {
+    if (!sidebar?.dataset.built) return;
+    const library = sidebar.querySelector("#codeLibrary");
+    for (const child of [...library.children])
+      if (!child.dataset.id || !visibleIds.includes(child.dataset.id))
+        child.remove();
+    for (const record of visibleIds
+      .map((id) => records.get(id))
+      .filter((record) => record?.session)
+      .sort(
+        (a, b) =>
+          b.session.updated_at - a.session.updated_at ||
+          b.id.localeCompare(a.id),
+      )) {
+      let card = library.querySelector(`[data-id="${CSS.escape(record.id)}"]`);
+      if (!card) {
+        card = UI.card("", "", "", () => navigate(record.id));
+        card.dataset.id = record.id;
+      }
+      card.children[0].textContent = record.session.title;
+      card.children[1].textContent = record.session.cwd;
+      card.children[2].textContent = busy(record)
+        ? "Running"
+        : record.session.error || record.session.model;
+      card.classList.toggle("active", record.id === selected);
+      card.classList.toggle("busy", busy(record));
+      if (record.id === selected) card.setAttribute("aria-current", "true");
+      else card.removeAttribute("aria-current");
+      library.append(card);
+    }
+    if (!library.children.length)
+      library.append(
+        element(
+          "div",
+          synchronized
+            ? query
+              ? "No matching sessions."
+              : "No sessions yet."
+            : "Loading sessions…",
+          "session-empty",
+        ),
+      );
+    sidebar.querySelector("#codeNew").disabled = !synchronized;
+    const more = sidebar.querySelector("#codeMore");
+    more.hidden = !nextCursor;
+    more.disabled = !synchronized || libraryLoading;
+  }
   function shell() {
     clearActivity();
     dismissDialog();
@@ -979,7 +1183,12 @@
             (model) =>
               model.provider_id === provider && model.model_name === name,
           );
-          if (model) void updateSettings({ model: model.id });
+          if (model) {
+            const state = saved(selected);
+            state.manualModel = true;
+            save(selected, state);
+            void updateSettings({ model: model.id });
+          }
         },
       );
       reasoningControl = UI.selectControl(
@@ -1036,7 +1245,15 @@
         reasoningControl.select,
       ])
         control.setAttribute("aria-describedby", selectionMessage.id);
-      const deletion = button("Delete", remove, "danger-button");
+      const autoButton = button("Auto: off", autoSettingsDialog);
+      autoButton.id = "codeAuto";
+      autoButton.title =
+        "Choose the model automatically for the first message of a new session";
+      const deletion = UI.setIcon(
+        button("Delete", remove, "danger-button"),
+        "Delete",
+        "trash",
+      );
       deletion.id = "codeDelete";
       const deletionMessage = element("div", "", "code-control-error");
       deletionMessage.id = "codeDeletionError";
@@ -1046,8 +1263,8 @@
       const deletionGroup = element("div");
       deletionGroup.append(deletion, deletionMessage);
       const header = UI.header(
-        "← Code sessions",
-        () => navigate(null),
+        null,
+        null,
         record.session?.title || "Code session",
         "Code title",
         (title) => {
@@ -1057,10 +1274,14 @@
           )
             void updateSettings({ title: title.value });
         },
-        [deletionGroup],
+        [autoButton, deletionGroup],
         controls,
       );
       header.append(element("p", "", "code-folder"));
+      const autoBadge = element("p", "", "code-auto-badge");
+      autoBadge.id = "codeAutoBadge";
+      autoBadge.hidden = true;
+      header.append(autoBadge);
       const transcript = element("div", undefined, "session-transcript");
       transcript.id = "codeTranscript";
       transcript.setAttribute("aria-label", "Conversation");
@@ -1110,47 +1331,25 @@
       UI.resizeComposer(composer.querySelector("textarea"));
     } else {
       const create = button("New code session", newSession, "primary-button");
-      create.id = "codeNew";
-      const header = UI.libraryHeader(
-        "Code sessions",
-        "Work with Codex in a project folder.",
+      create.id = "codeNewWelcome";
+      const welcome = element("div", undefined, "session-welcome");
+      welcome.append(
+        element("h2", "Code sessions"),
+        element(
+          "p",
+          "Pick a session from the sidebar, or start a new one in a project folder.",
+        ),
         create,
+        message,
       );
-      const search = UI.search("Search titles and folders", query, (value) => {
-        query = value;
-        visibleIds = [];
-        nextCursor = null;
-        ++libraryToken;
-        render();
-        void refreshLibrary();
-      });
-      const more = button(
-        "Load more sessions",
-        async () => {
-          libraryLoading = true;
-          render();
-          try {
-            await list(nextCursor);
-          } catch (error) {
-            restart(error.message);
-          }
-          libraryLoading = false;
-          render();
-        },
-        "secondary-button session-load-more",
-      );
-      more.id = "codeMore";
-      const library = element("div", undefined, "session-list");
-      library.id = "codeLibrary";
-      const wrapper = element("div", undefined, "session-library");
-      wrapper.append(header, search, message, library, more);
-      root.append(wrapper);
+      root.append(welcome);
     }
     rendered = selected || "library";
   }
 
   function render(outputChanged = false) {
     if (!root) return;
+    renderLibrary();
     if (rendered !== (selected || "library")) shell();
     const message = root.querySelector("#codeNotice");
     message.textContent =
@@ -1160,48 +1359,8 @@
       (!connected ? "Connecting…" : !synchronized ? "Synchronizing…" : "");
     message.hidden = !message.textContent;
     if (!selected) {
-      const library = root.querySelector("#codeLibrary");
-      for (const child of [...library.children])
-        if (!child.dataset.id || !visibleIds.includes(child.dataset.id))
-          child.remove();
-      for (const record of visibleIds
-        .map((id) => records.get(id))
-        .filter((record) => record?.session)
-        .sort(
-          (a, b) =>
-            b.session.updated_at - a.session.updated_at ||
-            b.id.localeCompare(a.id),
-        )) {
-        let card = library.querySelector(
-          `[data-id="${CSS.escape(record.id)}"]`,
-        );
-        if (!card) {
-          card = UI.card("", "", "", () => navigate(record.id));
-          card.dataset.id = record.id;
-        }
-        card.children[0].textContent = record.session.title;
-        card.children[1].textContent = record.session.cwd;
-        card.children[2].textContent = busy(record)
-          ? "Running"
-          : record.session.error || record.session.model;
-        library.append(card);
-      }
-      if (!library.children.length)
-        library.append(
-          element(
-            "div",
-            synchronized
-              ? query
-                ? "No matching sessions."
-                : "Start your first code session."
-              : "Loading sessions…",
-            "session-empty",
-          ),
-        );
-      root.querySelector("#codeNew").disabled = !synchronized;
-      const more = root.querySelector("#codeMore");
-      more.hidden = !nextCursor;
-      more.disabled = !synchronized || libraryLoading;
+      const create = root.querySelector("#codeNewWelcome");
+      if (create) create.disabled = !synchronized;
       return;
     }
     const record = records.get(selected),
@@ -1274,7 +1433,11 @@
     send.hidden = isBusy;
     stop.hidden = !isBusy;
     stop.disabled = !connected || record?.run?.stop_requested;
-    send.textContent = saved(selected).pending ? "Retry Send" : "Send";
+    UI.setIcon(
+      send,
+      saved(selected).pending ? "Retry Send" : "Send",
+      "send",
+    );
     send.classList.toggle("startup-busy", selectionLoading(record));
     send.setAttribute("aria-busy", String(selectionLoading(record)));
     send.disabled =
@@ -1289,13 +1452,25 @@
     input.disabled = !record?.loaded || record?.session?.status !== "ready";
     root.querySelector(".session-title").disabled =
       !ready(record) || settingsPending;
+    const autoButton = root.querySelector("#codeAuto"),
+      autoBadge = root.querySelector("#codeAutoBadge"),
+      auto = saved(selected).auto;
+    autoButton.textContent = autoSettings().enabled ? "Auto: on" : "Auto: off";
+    autoBadge.hidden = !auto;
+    if (auto)
+      autoBadge.textContent = auto.configured
+        ? `Auto → ${auto.level}${auto.reason ? `: ${auto.reason}` : ""} · ${auto.model}`
+        : `Auto → ${auto.level}: no model set for this level, kept ${auto.model}`;
     const deletion = root.querySelector("#codeDelete");
-    deletion.textContent =
+    UI.setIcon(
+      deletion,
       record?.session?.status === "delete_uncertain"
         ? "Check deletion"
         : record?.session?.status === "deleting"
           ? "Deleting…"
-          : "Delete";
+          : "Delete",
+      "trash",
+    );
     deletion.disabled =
       !synchronized ||
       !record?.loaded ||
@@ -1714,6 +1889,8 @@
     initialize(client) {
       api = client;
       root = document.getElementById("codeRoot");
+      sidebar = document.getElementById("sessionSidebar");
+      buildSidebar();
       if (desiredPath) activate(desiredPath);
     },
     activate,

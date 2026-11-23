@@ -40,7 +40,9 @@ def test_connection_check_uses_disabled_loading_button(
     button = page.locator(f"#{button_id}")
     for visit in range(2):
         if visit:
+            page.locator("#settingsMenuButton").click()
             page.get_by_role("button", name="Providers", exact=True).click()
+            page.locator("#settingsMenuButton").click()
             page.get_by_role("button", name="Integrations", exact=True).click()
         expect(button).to_be_disabled()
         expect(button).to_have_text("Loading…")
@@ -258,8 +260,10 @@ def test_manual_setup_and_revisit_read_the_file(
     page.locator("#openClaudeOnboarding").click()
     page.locator("#confirmClaudeOnboarding").click()
     expect(page.locator("#openClaudeIntegration")).to_have_text("Disconnect")
+    page.locator("#settingsMenuButton").click()
     page.get_by_role("button", name="Providers", exact=True).click()
     path.write_text("{}")
+    page.locator("#settingsMenuButton").click()
     page.get_by_role("button", name="Integrations", exact=True).click()
     expect(page.locator("#openClaudeIntegration")).to_have_text("Connect")
 
@@ -277,8 +281,10 @@ def test_invalid_settings_error_can_be_retried_and_does_not_break_admin(
         "aria-busy", "false"
     )
     expect(page.locator("#view-integrations .status-pill")).to_have_count(0)
+    page.locator("#settingsMenuButton").click()
     page.get_by_role("button", name="Providers", exact=True).click()
     expect(page.locator('[data-provider="nvidia_nim"]')).to_be_visible()
+    page.locator("#settingsMenuButton").click()
     page.get_by_role("button", name="Integrations", exact=True).click()
     path.write_text("{}")
     page.locator("#openClaudeIntegration").click()
@@ -321,8 +327,10 @@ def test_codex_existing_setup_revisit_and_invalid_config_retry(
     page.goto(f"{admin_base_url}/admin/integrations")
     opener = page.locator("#openCodexIntegration")
     expect(opener).to_have_text("Disconnect")
+    page.locator("#settingsMenuButton").click()
     page.get_by_role("button", name="Providers", exact=True).click()
     path.write_text("[invalid")
+    page.locator("#settingsMenuButton").click()
     page.get_by_role("button", name="Integrations", exact=True).click()
     expect(page.locator("#codexIntegrationMessage")).to_contain_text("Check the TOML")
     expect(opener).to_have_text("Retry")
@@ -453,10 +461,11 @@ def admin_client_files(request: pytest.FixtureRequest, tmp_path: Path):
 def test_startup_updates_before_opening_integrations(
     admin_client_files: Path, admin_base_url: str, page: Page, tmp_path: Path
 ):
-    page.goto(f"{admin_base_url}/admin")
+    page.goto(f"{admin_base_url}/admin/providers")
     page.wait_for_function(
         "state.startup?.startup?.integrations['claude-vscode']?.state === 'ready'"
     )
+    page.locator("#settingsMenuButton").click()
     page.get_by_role("button", name="Integrations", exact=True).click()
     button = page.locator("#openClaudeIntegration")
     expect(button).to_have_text("Disconnect")
@@ -510,7 +519,9 @@ def test_independent_onboarding_modal_and_completion(
     assert json.loads(state.read_text())["hasCompletedOnboarding"] is True
     assert not settings.exists()
     state.write_text('{"hasCompletedOnboarding":false}')
+    page.locator("#settingsMenuButton").click()
     page.get_by_role("button", name="Providers", exact=True).click()
+    page.locator("#settingsMenuButton").click()
     page.get_by_role("button", name="Integrations", exact=True).click()
     expect(button).to_have_text("Complete onboarding")
     assert state.read_text() == '{"hasCompletedOnboarding":false}'
